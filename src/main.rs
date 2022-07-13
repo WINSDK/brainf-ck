@@ -12,6 +12,7 @@ macro_rules! exit {
 
 trait Indentation {
     fn push_indented(&mut self, line: &str);
+    fn push_libc_call(&mut self, line: &str);
     fn push_label(&mut self, label: &str);
 }
 
@@ -22,8 +23,18 @@ impl Indentation for String {
         self.push('\n');
     }
 
+    fn push_libc_call(&mut self, line: &str) {
+        self.push_str("    call ");
+
+        if std::env::consts::OS != "linux" {
+            self.push('_')
+        }
+
+        self.push_str(line);
+        self.push('\n');
+    }
+
     fn push_label(&mut self, label: &str) {
-        self.push('_');
         self.push_str(label);
         self.push_str(":\n");
     }
@@ -32,7 +43,7 @@ impl Indentation for String {
 fn main() -> std::io::Result<()> {
     let mut files = std::env::args()
         .skip(1)
-        .filter(|p| p.ends_with("b"))
+        .filter(|p| p.ends_with('b'))
         .map(std::path::PathBuf::from)
         .peekable();
 
@@ -40,7 +51,7 @@ fn main() -> std::io::Result<()> {
         exit!("brainf*ck error: no input files");
     }
 
-    while let Some(file_name) = files.next() {
+    for file_name in files {
         let mut instructions = String::new();
         let syntax = match fs::read(&file_name) {
             Ok(data) => data,
@@ -49,11 +60,20 @@ fn main() -> std::io::Result<()> {
 
         // Section header
         instructions.push_str("section .text\n");
-        instructions.push_indented("extern _putchar");
-        instructions.push_indented("extern _getchar");
-        instructions.push_indented("global _main");
 
-        instructions.push_label("main");
+        if std::env::consts::OS == "linux" {
+            instructions.push_indented("extern putchar");
+            instructions.push_indented("extern getchar");
+            instructions.push_indented("global main");
+
+            instructions.push_label("main");
+        } else {
+            instructions.push_indented("extern _putchar");
+            instructions.push_indented("extern _getchar");
+            instructions.push_indented("global _main");
+
+            instructions.push_label("_main");
+        }
 
         // Allign stack
         instructions.push_indented("push rbp");
@@ -62,7 +82,7 @@ fn main() -> std::io::Result<()> {
 
         // Zero out the stack
         instructions.push_indented("xor r8, r8");
-        instructions.push_label("zeroed");
+        instructions.push_label("_zeroed");
         instructions.push_indented("mov qword [rbp + r8], 0");
         instructions.push_indented("add r8, 8");
         instructions.push_indented("test r8, 4096");
@@ -86,7 +106,7 @@ fn main() -> std::io::Result<()> {
 
             match chr {
                 b'[' => {
-                    instructions.push_label(&format!("_L{}", labels_disambiguator));
+                    instructions.push_label(&format!("__L{}", labels_disambiguator));
                     instructions.push_indented("mov cl, [rbp]");
                     instructions.push_indented("test cl, cl");
 
@@ -99,14 +119,14 @@ fn main() -> std::io::Result<()> {
                     let label = while_loop_stack.pop().expect("Mismatched `[..]`");
 
                     instructions.push_indented(&format!("jmp __L{}", label));
-                    instructions.push_label(&format!("_L{}", label + 1));
+                    instructions.push_label(&format!("__L{}", label + 1));
                 }
                 b'.' => {
                     instructions.push_indented("movzx rdi, byte [rbp]");
-                    instructions.push_indented("call _putchar");
+                    instructions.push_libc_call("putchar");
                 }
                 b',' => {
-                    instructions.push_indented("call _getchar");
+                    instructions.push_libc_call("getchar");
                     instructions.push_indented("mov byte [rbp], ah");
                 }
                 b'>' => instructions.push_indented(&format!("add rbp, {count}")),
@@ -125,7 +145,7 @@ fn main() -> std::io::Result<()> {
 
         // Newline
         instructions.push_indented("mov rdi, 10");
-        instructions.push_indented("call _putchar");
+        instructions.push_libc_call("putchar");
 
         // Align stack
         instructions.push_indented("add rsp, 4096");
@@ -136,8 +156,15 @@ fn main() -> std::io::Result<()> {
         let asm_output = file_name.with_extension("asm");
         fs::write(&asm_output, instructions)?;
 
+        let file_format = match std::env::consts::OS {
+            "windows" => "win64",
+            "macos" => "macho64",
+            "linux" => "elf64",
+            target => panic!("target `{target}` is not supported"),
+        };
+
         let output = std::process::Command::new("nasm")
-            .args(&["-f", "macho64"])
+            .args(&["-f", file_format])
             .arg(asm_output)
             .spawn()?
             .wait_with_output()?;
@@ -147,7 +174,6 @@ fn main() -> std::io::Result<()> {
         }
 
         let output = std::process::Command::new("clang")
-            .args(&["-arch", "x86_64"])
             .args(&["-o", file_name.file_stem().and_then(|x| x.to_str()).unwrap_or("main")])
             .arg(file_name.with_extension("o"))
             .spawn()?
